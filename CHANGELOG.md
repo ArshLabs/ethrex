@@ -2,6 +2,10 @@
 
 ## Perf
 
+### 2026-03-09
+
+- Replace per-block thread spawning with persistent rayon thread pool for merkleization [#6344](https://github.com/lambdaclass/ethrex/pull/6344)
+
 ### 2026-03-05
 
 - Switch hot EVM and mempool HashMaps to FxHashMap for faster hashing [#6303](https://github.com/lambdaclass/ethrex/pull/6303)
