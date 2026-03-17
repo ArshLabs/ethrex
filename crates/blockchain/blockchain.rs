@@ -74,6 +74,7 @@ pub use ethrex_common::{
     get_total_blob_gas, validate_block_access_list_hash, validate_block_pre_execution,
     validate_gas_used, validate_receipts_root, validate_requests_hash,
 };
+use ethrex_crypto::NativeCrypto;
 use ethrex_metrics::metrics;
 use ethrex_rlp::constants::RLP_NULL;
 use ethrex_rlp::decode::RLPDecode;
@@ -440,9 +441,12 @@ impl Blockchain {
         // Replace the VM's store with the caching version
         vm.db.store = caching_store.clone();
 
+        let cancelled = AtomicBool::new(false);
+
         let (execution_result, merkleization_result, warmer_duration) =
             std::thread::scope(|s| -> Result<_, ChainError> {
                 let vm_type = vm.vm_type;
+                let cancelled_ref = &cancelled;
                 let warm_handle = std::thread::Builder::new()
                     .name("block_executor_warmer".to_string())
                     .spawn_scoped(s, move || {
@@ -451,12 +455,20 @@ impl Blockchain {
                         let start = Instant::now();
                         if let Some(bal) = bal {
                             // Amsterdam+: BAL-based precise prefetching (no tx re-execution)
-                            if let Err(e) = LEVM::warm_block_from_bal(bal, caching_store) {
+                            if let Err(e) =
+                                LEVM::warm_block_from_bal(bal, caching_store, cancelled_ref)
+                            {
                                 debug!("BAL warming failed (non-fatal): {e}");
                             }
                         } else {
                             // Pre-Amsterdam / P2P sync: speculative tx re-execution
-                            if let Err(e) = LEVM::warm_block(block, caching_store, vm_type) {
+                            if let Err(e) = LEVM::warm_block(
+                                block,
+                                caching_store,
+                                vm_type,
+                                &NativeCrypto,
+                                cancelled_ref,
+                            ) {
                                 debug!("Block warming failed (non-fatal): {e}");
                             }
                         }
@@ -470,8 +482,9 @@ impl Blockchain {
                 let execution_handle = std::thread::Builder::new()
                     .name("block_executor_execution".to_string())
                     .spawn_scoped(s, move || -> Result<_, ChainError> {
-                        let (execution_result, produced_bal) =
-                            vm.execute_block_pipeline(block, tx, queue_length_ref, bal)?;
+                        let result = vm.execute_block_pipeline(block, tx, queue_length_ref, bal);
+                        cancelled_ref.store(true, Ordering::Relaxed);
+                        let (execution_result, produced_bal) = result?;
 
                         // Validate execution went alright
                         validate_gas_used(execution_result.block_gas_used, &block.header)?;
@@ -525,22 +538,20 @@ impl Blockchain {
                     .map_err(|e| {
                         ChainError::Custom(format!("Failed to spawn merkleizer thread: {e}"))
                     })?;
+                let execution_result = execution_handle.join().unwrap_or_else(|_| {
+                    Err(ChainError::Custom("execution thread panicked".to_string()))
+                });
+                let merkleization_result = merkleize_handle.join().unwrap_or_else(|_| {
+                    Err(StoreError::Custom(
+                        "merkleization thread panicked".to_string(),
+                    ))
+                });
                 let warmer_duration = warm_handle
                     .join()
                     .inspect_err(|e| warn!("Warming thread error: {e:?}"))
                     .ok()
                     .unwrap_or(Duration::ZERO);
-                Ok((
-                    execution_handle.join().unwrap_or_else(|_| {
-                        Err(ChainError::Custom("execution thread panicked".to_string()))
-                    }),
-                    merkleize_handle.join().unwrap_or_else(|_| {
-                        Err(StoreError::Custom(
-                            "merklization thread panicked".to_string(),
-                        ))
-                    }),
-                    warmer_duration,
-                ))
+                Ok((execution_result, merkleization_result, warmer_duration))
             })?;
         let (account_updates_list, accumulated_updates, merkle_end_instant) = merkleization_result?;
         let (execution_result, produced_bal, exec_end_instant) = execution_result?;
@@ -1360,7 +1371,9 @@ impl Blockchain {
             let logger = Arc::new(DatabaseLogger::new(Arc::new(vm_db)));
 
             let mut vm = match self.options.r#type {
-                BlockchainType::L1 => Evm::new_from_db_for_l1(logger.clone()),
+                BlockchainType::L1 => {
+                    Evm::new_from_db_for_l1(logger.clone(), Arc::new(NativeCrypto))
+                }
                 BlockchainType::L2(_) => {
                     let l2_config = match fee_configs {
                         Some(fee_configs) => {
@@ -1372,7 +1385,7 @@ impl Blockchain {
                             "L2Config not found for witness generation".to_string(),
                         ))?,
                     };
-                    Evm::new_from_db_for_l2(logger.clone(), *l2_config)
+                    Evm::new_from_db_for_l2(logger.clone(), *l2_config, Arc::new(NativeCrypto))
                 }
             };
 
@@ -1566,15 +1579,6 @@ impl Blockchain {
             block_headers_bytes.push(current_header.encode_to_vec());
         }
 
-        // Create a list of all read/write addresses and storage slots
-        let mut keys = Vec::new();
-        for (address, touched_storage_slots) in touched_account_storage_slots {
-            keys.push(address.as_bytes().to_vec());
-            for slot in touched_storage_slots.iter() {
-                keys.push(slot.as_bytes().to_vec());
-            }
-        }
-
         // Get initial state trie root and embed the rest of the trie into it
         let nodes: BTreeMap<H256, Node> = used_trie_nodes
             .into_iter()
@@ -1595,12 +1599,9 @@ impl Blockchain {
             Trie::new_temp()
         };
         let mut storage_trie_roots = BTreeMap::new();
-        for key in &keys {
-            if key.len() != 20 {
-                continue; // not an address
-            }
-            let address = Address::from_slice(key);
-            let hashed_address = hash_address(&address);
+        for address in touched_account_storage_slots.keys() {
+            let hashed_address = hash_address(address);
+            let hashed_address_h256 = H256::from_slice(&hashed_address);
             let Some(encoded_account) = state_trie.get(&hashed_address)? else {
                 continue; // empty account, doesn't have a storage trie
             };
@@ -1617,7 +1618,7 @@ impl Blockchain {
                     "execution witness does not contain non-empty storage trie".to_string(),
                 ));
             };
-            storage_trie_roots.insert(address, (*node).clone());
+            storage_trie_roots.insert(hashed_address_h256, (*node).clone());
         }
 
         Ok(ExecutionWitness {
@@ -1627,7 +1628,6 @@ impl Blockchain {
             chain_config: self.storage.get_chain_config(),
             state_trie_root,
             storage_trie_roots,
-            keys,
         })
     }
 
@@ -1808,15 +1808,6 @@ impl Blockchain {
             block_headers_bytes.push(current_header.encode_to_vec());
         }
 
-        // Create a list of all read/write addresses and storage slots
-        let mut keys = Vec::new();
-        for (address, touched_storage_slots) in touched_account_storage_slots {
-            keys.push(address.as_bytes().to_vec());
-            for slot in touched_storage_slots.iter() {
-                keys.push(slot.as_bytes().to_vec());
-            }
-        }
-
         // Get initial state trie root and embed the rest of the trie into it
         let nodes: BTreeMap<H256, Node> = used_trie_nodes
             .into_iter()
@@ -1837,12 +1828,9 @@ impl Blockchain {
             Trie::new_temp()
         };
         let mut storage_trie_roots = BTreeMap::new();
-        for key in &keys {
-            if key.len() != 20 {
-                continue; // not an address
-            }
-            let address = Address::from_slice(key);
-            let hashed_address = hash_address(&address);
+        for address in touched_account_storage_slots.keys() {
+            let hashed_address = hash_address(address);
+            let hashed_address_h256 = H256::from_slice(&hashed_address);
             let Some(encoded_account) = state_trie.get(&hashed_address)? else {
                 continue; // empty account, doesn't have a storage trie
             };
@@ -1859,7 +1847,7 @@ impl Blockchain {
                     "execution witness does not contain non-empty storage trie".to_string(),
                 ));
             };
-            storage_trie_roots.insert(address, (*node).clone());
+            storage_trie_roots.insert(hashed_address_h256, (*node).clone());
         }
 
         Ok(ExecutionWitness {
@@ -1869,7 +1857,6 @@ impl Blockchain {
             chain_config: self.storage.get_chain_config(),
             state_trie_root,
             storage_trie_roots,
-            keys,
         })
     }
 
@@ -1894,6 +1881,7 @@ impl Blockchain {
             receipts: vec![(block.hash(), execution_result.receipts)],
             blocks: vec![block],
             code_updates: account_updates_list.code_updates,
+            batch_mode: false,
         };
 
         self.storage
@@ -1990,12 +1978,15 @@ impl Blockchain {
             let logger = Arc::new(DatabaseLogger::new(Arc::new(vm_db)));
 
             let vm = match self.options.r#type.clone() {
-                BlockchainType::L1 => Evm::new_from_db_for_l1(logger.clone()),
+                BlockchainType::L1 => {
+                    Evm::new_from_db_for_l1(logger.clone(), Arc::new(NativeCrypto))
+                }
                 BlockchainType::L2(l2_config) => Evm::new_from_db_for_l2(
                     logger.clone(),
                     *l2_config.fee_config.read().map_err(|_| {
                         EvmError::Custom("Fee config lock was poisoned".to_string())
                     })?,
+                    Arc::new(NativeCrypto),
                 ),
             };
             (vm, Some(logger))
@@ -2404,6 +2395,7 @@ impl Blockchain {
             blocks,
             receipts: all_receipts,
             code_updates,
+            batch_mode: true,
         };
 
         self.storage
@@ -2461,7 +2453,7 @@ impl Blockchain {
             blobs_bundle.validate(transaction, fork)?;
         }
 
-        let sender = transaction.sender()?;
+        let sender = transaction.sender(&NativeCrypto)?;
 
         // Validate transaction
         if let Some(tx_to_replace) = self.validate_transaction(&transaction, sender).await? {
@@ -2489,7 +2481,7 @@ impl Blockchain {
         if self.mempool.contains_tx(hash)? {
             return Ok(hash);
         }
-        let sender = transaction.sender()?;
+        let sender = transaction.sender(&NativeCrypto)?;
         // Validate transaction
         if let Some(tx_to_replace) = self.validate_transaction(&transaction, sender).await? {
             self.remove_transaction_from_pool(&tx_to_replace)?;
@@ -2719,14 +2711,14 @@ impl Blockchain {
 
 pub fn new_evm(blockchain_type: &BlockchainType, vm_db: StoreVmDatabase) -> Result<Evm, EvmError> {
     let evm = match blockchain_type {
-        BlockchainType::L1 => Evm::new_for_l1(vm_db),
+        BlockchainType::L1 => Evm::new_for_l1(vm_db, Arc::new(NativeCrypto)),
         BlockchainType::L2(l2_config) => {
             let fee_config = *l2_config
                 .fee_config
                 .read()
                 .map_err(|_| EvmError::Custom("Fee config lock was poisoned".to_string()))?;
 
-            Evm::new_for_l2(vm_db, fee_config)?
+            Evm::new_for_l2(vm_db, fee_config, Arc::new(NativeCrypto))?
         }
     };
     Ok(evm)
