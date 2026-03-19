@@ -376,17 +376,14 @@ impl NodeRecordPairs {
     /// nodes use the same port for both families).
     /// Returns `None` if no usable address is present in the ENR.
     pub fn connection_addr(&self) -> Option<(IpAddr, u16)> {
-        if let (Some(ip), Some(port)) = (self.ip, self.tcp_port) {
-            if !ip.is_unspecified() {
-                return Some((IpAddr::V4(ip), port));
-            }
+        if let (Some(ip), Some(port)) = (self.ip, self.tcp_port) && !ip.is_unspecified() {
+            return Some((IpAddr::V4(ip), port));
         }
-        if let Some(ip6) = self.ip6 {
-            if !ip6.is_unspecified() {
-                if let Some(port) = self.tcp6_port.or(self.tcp_port) {
-                    return Some((IpAddr::V6(ip6), port));
-                }
-            }
+        if let Some(ip6) = self.ip6
+            && !ip6.is_unspecified()
+            && let Some(port) = self.tcp6_port.or(self.tcp_port)
+        {
+            return Some((IpAddr::V6(ip6), port));
         }
         None
     }
@@ -542,14 +539,12 @@ impl NodeRecord {
                     record
                         .pairs
                         .push(("ip6".into(), ipv6.encode_to_vec().into()));
-                    record.pairs.push((
-                        "tcp6".into(),
-                        network_config.tcp_port.encode_to_vec().into(),
-                    ));
-                    record.pairs.push((
-                        "udp6".into(),
-                        network_config.udp_port.encode_to_vec().into(),
-                    ));
+                    record
+                        .pairs
+                        .push(("tcp6".into(), network_config.tcp_port.encode_to_vec().into()));
+                    record
+                        .pairs
+                        .push(("udp6".into(), network_config.udp_port.encode_to_vec().into()));
                 }
             }
         }
